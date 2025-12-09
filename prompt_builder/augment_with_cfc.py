@@ -11,6 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# python augment_with_cfc.py --repo_path /path/to/your/project --language python --ranking_fn bm25 --maximum_cross_file_chunk 10
+
 import os
 import json
 import time
@@ -26,14 +28,15 @@ CHUNK_SIZE = 10
 SLIDING_WINDOW_SIZE = 10  # non-overlapping chunks if SLIDING_WINDOW_SIZE=CHUNK_SIZE
 QUERY_LENGTH = 10  # last N lines from prompt will be query
 
-repository_root = "/PATH/TO/REPOS"  # get the data from authors
+# Global variable to store the user-provided repository root
+# repository_root = ""
 
-input_files = {
-    "python": "../data/crosscodeeval_data/python/line_completion.jsonl",
-    "java": "../data/crosscodeeval_data/java/line_completion.jsonl",
-    "typescript": "../data/crosscodeeval_data/typescript/line_completion.jsonl",
-    "csharp": "../data/crosscodeeval_data/csharp/line_completion.jsonl"
-}
+# input_files = {
+#     "python": "../data/crosscodeeval_data/python/line_completion.jsonl",
+#     "java": "../data/crosscodeeval_data/java/line_completion.jsonl",
+#     "typescript": "../data/crosscodeeval_data/typescript/line_completion.jsonl",
+#     "csharp": "../data/crosscodeeval_data/csharp/line_completion.jsonl"
+# }
 
 file_ext = {"python": "py", "java": "java", "typescript": "ts", "csharp": "cs"}
 
@@ -143,6 +146,43 @@ def get_crossfile_context_from_chunks(
         cfc_text += "\n".join([f"{line_start_sym} {cl}" for cl in sc.strip('\n').splitlines()]) + "\n\n"
 
     return cross_file_context, cfc_text, meta_data
+
+
+def read_project_files_custom(repo_path, lang):
+    # root_dir needs a trailing slash (i.e. /root/dir/)
+    project_context = {}
+    root_dir = repo_path
+    if not os.path.isdir(root_dir):
+        print(f"Repository not found: {root_dir}")
+        return project_context
+
+    if lang == "typescript":
+        src_files = []
+        src_files += glob.glob(os.path.join(root_dir, f'**/*.ts'), recursive=True)
+        src_files += glob.glob(os.path.join(root_dir, f'**/*.tsx'), recursive=True)
+    else:
+        src_files = glob.glob(os.path.join(root_dir, f'**/*.{file_ext[lang]}'), recursive=True)
+
+    if len(src_files) == 0:
+        return project_context
+
+    for filename in src_files:
+        if os.path.exists(filename):  # weird but some files cannot be opened to read
+            if os.path.isfile(filename):
+                try:
+                    with open(filename, "r") as file:
+                        file_content = file.read()
+                except:
+                    with open(filename, "rb") as file:
+                        file_content = file.read().decode(errors='replace')
+
+                fileid = os.path.relpath(filename, root_dir)
+                project_context[fileid] = file_content
+        else:
+            pass
+            # print(f"File not found: {filename}")
+
+    return project_context
 
 
 def read_project_files(repo_name, lang):
@@ -258,6 +298,120 @@ def get_cfc(example, args, semantic_ranker, repositories):
                 example["crossfile_context"]["list"] = cfc
 
     return example, status
+
+
+def generate_input_examples_for_project(repo_path, language):
+    """
+    Generate input examples for a given project path.
+    
+    Args:
+        repo_path: Path to the repository
+        language: Programming language
+    
+    Returns:
+        List of examples in the format expected by the CFC processing
+    """
+    examples = []
+    
+    # Get all source files in the project
+    if language == "typescript":
+        src_files = []
+        src_files += glob.glob(os.path.join(repo_path, f'**/*.ts'), recursive=True)
+        src_files += glob.glob(os.path.join(repo_path, f'**/*.tsx'), recursive=True)
+    else:
+        src_files = glob.glob(os.path.join(repo_path, f'**/*.{file_ext[language]}'), recursive=True)
+    
+    # For each file, create an example with:
+    # - prompt: first part of the file (before a cut point)
+    # - groundtruth: the rest of the file (what should be predicted)
+    # - metadata: containing repository name and file path
+    for file_path in src_files:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        
+        if content.strip():  # Only process non-empty files
+            # For simplicity, we'll split the file in half - first half as prompt, second as groundtruth
+            # In practice, you might want a different strategy depending on your use case
+            lines = content.splitlines()
+            split_point = len(lines) // 2
+            prompt_lines = lines[:split_point]
+            groundtruth_lines = lines[split_point:]
+            
+            prompt = "\n".join(prompt_lines)
+            groundtruth = "\n".join(groundtruth_lines)
+            
+            # Get relative path as the file identifier
+            relative_file_path = os.path.relpath(file_path, repo_path)
+            
+            # Use directory name as repository name
+            repo_name = os.path.basename(os.path.abspath(repo_path))
+            
+            example = {
+                "prompt": prompt,
+                "groundtruth": groundtruth,
+                "metadata": {
+                    "repository": repo_name,
+                    "file": relative_file_path
+                }
+            }
+            
+            examples.append(example)
+    
+    return examples
+
+
+def attach_data_custom(args, repo_path):
+    """Modified version of attach_data to work with a custom repository path"""
+    empty_cfc = 0
+    error_freq = {
+        "project_not_found": 0,
+        "file_not_found_in_project": 0,
+        "no_crossfile_context": 0
+    }
+    output_examples = []
+
+    # Generate examples for the custom repository
+    examples = generate_input_examples_for_project(repo_path, args.language)
+    print(f"Generated {len(examples)} examples from repository: {repo_path}")
+
+    # Load the project context
+    repositories = dict()
+    repo_name = os.path.basename(os.path.abspath(repo_path))
+    repositories[repo_name] = read_project_files_custom(repo_path, args.language)
+    
+    if len(repositories[repo_name]) == 0:
+        print(f"No files found in repository: {repo_path}")
+        return []
+
+    semantic_ranker = None
+    if args.ranking_fn == "cosine_sim":
+        semantic_ranker = SemanticReranking(
+            args.ranker,
+            max_sequence_length=256
+        )
+
+    pool = mp.Pool(args.num_processes)
+    worker = partial(get_cfc, args=args, semantic_ranker=semantic_ranker, repositories=repositories)
+
+    with tqdm(total=len(examples)) as pbar:
+        for (d, stat) in pool.imap_unordered(worker, examples):
+            if stat in error_freq:
+                error_freq[stat] += 1
+            if len(d["crossfile_context"]) == 0:
+                empty_cfc += 1
+                if not args.skip_if_no_cfc:
+                    output_examples.append(d)
+            else:
+                output_examples.append(d)
+            pbar.update()
+
+    print("Total examples with empty CFC: ", empty_cfc)
+    print(error_freq)
+    return output_examples
 
 
 def attach_data(args, srcfile):
@@ -384,6 +538,16 @@ if __name__ == "__main__":
         choices=["java", "python", "typescript", "csharp"],
         help="language name"
     )
+    parser.add_argument(
+        "--repo_path",
+        type=str,
+        help="path to the repository to process (for custom projects)"
+    )
+    parser.add_argument(
+        "--input_file",
+        type=str,
+        help="path to the input jsonl file (default behavior)"
+    )
     args = parser.parse_args()
 
     args.output_file_suffix = "" if args.output_file_suffix is None else f"_{args.output_file_suffix}"
@@ -401,12 +565,27 @@ if __name__ == "__main__":
         args.num_processes = num_gpus
         mp.set_start_method('spawn')
 
-    input_file = input_files[args.language]
-    output_path = os.path.dirname(input_file)
-    output_filename = os.path.splitext(os.path.basename(input_file))[0]
-    output_filename = output_filename + args.output_file_suffix + tgtfile_suffix + ".jsonl"
-    output_file = os.path.join(output_path, output_filename)
-    output_examples = attach_data(args, input_file)
+    # Handle custom repository processing
+    if args.repo_path:
+        # Update the global repository root
+        globals()['repository_root'] = args.repo_path
+
+        output_path = os.path.dirname(args.repo_path)
+        repo_name = os.path.basename(os.path.abspath(args.repo_path))
+        output_filename = f"{repo_name}_cfc_{args.language}{args.output_file_suffix}{tgtfile_suffix}.jsonl"
+        output_file = os.path.join(output_path, output_filename)
+        output_examples = attach_data_custom(args, args.repo_path)
+    else:
+        # Default behavior: process input jsonl file
+        if not args.input_file:
+            args.input_file = input_files[args.language]
+
+        output_path = os.path.dirname(args.input_file)
+        output_filename = os.path.splitext(os.path.basename(args.input_file))[0]
+        output_filename = output_filename + args.output_file_suffix + tgtfile_suffix + ".jsonl"
+        output_file = os.path.join(output_path, output_filename)
+        output_examples = attach_data(args, args.input_file)
+
     with open(output_file, "w") as fw:
         for ex in output_examples:
             fw.write(json.dumps(ex))
